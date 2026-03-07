@@ -98,9 +98,32 @@ async function decryptData(b64) {
   }
 }
 
+// ── STORAGE: localStorage como primário, window.storage como fallback ────────
+async function storageSet(key, value) {
+  try { localStorage.setItem(key, value); } catch(e) {}
+  try { await window.storage.set(key, value); } catch(e) {}
+}
+async function storageGet(key) {
+  // Tentar localStorage primeiro
+  try {
+    const v = localStorage.getItem(key);
+    if (v) return {value: v};
+  } catch(e) {}
+  // Fallback: window.storage
+  try {
+    const r = await window.storage.get(key);
+    if (r?.value) {
+      // Sincronizar de volta ao localStorage
+      try { localStorage.setItem(key, r.value); } catch(e2) {}
+      return r;
+    }
+  } catch(e) {}
+  return null;
+}
+
 async function saveEncrypted(key, obj) {
   const enc = await encryptData(obj);
-  await window.storage.set(key, enc);
+  await storageSet(key, enc);
 }
 
 
@@ -157,7 +180,7 @@ function fbListen(path, callback) {
 
 async function loadEncrypted(key) {
   try {
-    const r = await window.storage.get(key);
+    const r = await storageGet(key);
     if (!r?.value) return null;
     return await decryptData(r.value);
   } catch(e) { return null; }
@@ -288,322 +311,501 @@ const STARS = Array.from({length:55},(_,i)=>({
   delay: (i%6)*0.7,
 }));
 
+// ── SUPER ADMIN PRÉ-CONFIGURADO ──────────────────────────────────────────────
+const SUPER_ADMIN = {
+  id: 1,
+  nome: "Fabricio de Carvalho",
+  pin: hashPin("5779"),
+  nivel: "super",
+  cadastroCompleto: true
+};
+
 function PinLogin({onLogin}) {
-  const [phase, setPhase] = useState("lock");
-  const [pin, setPin] = useState("");
-  const [err, setErr] = useState("");
-  const [shake, setShake] = useState(false);
-  const [loading, setLoading] = useState(false);
+  // phases: "lock" | "login" | "cadastro"
+  const [phase, setPhase]   = useState("lock");
+  const [loginNome, setLoginNome] = useState("");
+  const [loginPin, setLoginPin]   = useState("");
+  const [loginErr, setLoginErr]   = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
   const [success, setSuccess] = useState(false);
-  const [ripples, setRipples] = useState([]);
-  const [ready, setReady] = useState(false);
-  const pinRef = useRef("");
+  const [ready, setReady]   = useState(false);
 
-
-  const DIAS = ["Domingo","Segunda","Terca","Quarta","Quinta","Sexta","Sabado"];
-  const MESES = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"];
-
+  // Cadastro novo (formulário de membro + PIN)
+  const [cadStep, setCadStep] = useState(1); // 1=dados pessoais, 2=criar PIN
+  const [cadForm, setCadForm] = useState({
+    nome:"", cpf:"", nascimento:"", sexo:"", estadoCivil:"", telefone:"",
+    email:"", cidade:"", cargo:"Membro", ministerio:"Nenhum",
+    pin:"", confirmar:"", lgpd:false
+  });
+  const [cadErr, setCadErr]   = useState("");
+  const [cadOk, setCadOk]     = useState(false);
+  const [lockCount, setLockCount] = useState(10);
 
   const authRef = useRef(null);
 
+  // ── Inicializar auth com super admin fixo ──────────────────────────────────
   useEffect(() => {
     (async () => {
       try {
-        const r = await window.storage.get("church_auth");
-        if (r && r.value) {
-          authRef.current = JSON.parse(r.value);
-        }
+        const r = await storageGet("church_auth");
+        if (r?.value) authRef.current = JSON.parse(r.value);
       } catch(e) {}
+
       if (!authRef.current) {
-        const h = hashPin(PIN_PADRAO);
-        const def = {admins:[{id:1,nome:"Administrador",pin:h,nivel:"super"}]};
-        authRef.current = def;
-        try { await window.storage.set("church_auth", JSON.stringify(def)); } catch(e2) {}
+        authRef.current = {admins:[SUPER_ADMIN], pendentes:[]};
+      } else {
+        // Garantir super admin sempre presente e atualizado
+        if (!authRef.current.pendentes) authRef.current.pendentes = [];
+        const temSuper = authRef.current.admins?.some(a => a.nivel === "super");
+        if (!temSuper) {
+          authRef.current.admins = [SUPER_ADMIN, ...(authRef.current.admins||[])];
+        } else {
+          // Atualizar dados do super admin (nome e pin podem ter mudado)
+          authRef.current.admins = authRef.current.admins.map(a =>
+            a.nivel === "super" ? {...a, nome:SUPER_ADMIN.nome, pin:SUPER_ADMIN.pin, cadastroCompleto:true} : a
+          );
+        }
+        // Todos os admins aprovados têm acesso direto (cadastroCompleto:true)
+        authRef.current.admins = authRef.current.admins.map(a =>
+          ({...a, cadastroCompleto: true})
+        );
       }
+      try { await storageSet("church_auth", JSON.stringify(authRef.current)); } catch(e) {}
       setReady(true);
     })();
   }, []);
 
-  function spawnRipple(e) {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const id = Date.now() + Math.random();
-    setRipples(r => [...r, {id,x,y}]);
-    setTimeout(() => setRipples(r => r.filter(rp => rp.id !== id)), 700);
-  }
+  // ── Countdown automático na tela de boas-vindas ────────────────────────────
+  useEffect(() => {
+    if (phase !== "lock") return;
+    setLockCount(2);
+    const t = setInterval(() => {
+      setLockCount(c => {
+        if (c <= 1) { clearInterval(t); setPhase("login"); return 0; }
+        return c - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [phase]);
 
-  function press(k, e) {
-    if (pinRef.current.length >= 4 || loading || success) return;
-    if (e) spawnRipple(e);
-    const next = pinRef.current + k;
-    pinRef.current = next;
-    setPin(next);
-    setErr("");
-    if (next.length === 4) setTimeout(() => tryLogin(next), 80);
-  }
+  // ── Login: nome + PIN — busca em admins E users ────────────────────────────
+  function tryLogin() {
+    const n = loginNome.trim();
+    const p = loginPin.trim();
+    if (!n || n.length < 2) { setLoginErr("Digite seu nome"); return; }
+    if (!p || p.length < 4) { setLoginErr("Digite seu PIN (mínimo 4 dígitos)"); return; }
 
-  function del() {
-    if (loading || success) return;
-    const next = pinRef.current.slice(0,-1);
-    pinRef.current = next;
-    setPin(next);
-    setErr("");
-  }
-
-  function tryLogin(code) {
-    const p = code || pinRef.current;
-    if (p.length < 4) { setErr("Digite pelo menos 4 digitos"); return; }
-    setLoading(true);
+    setLoginLoading(true);
+    setLoginErr("");
     const data = authRef.current;
-    if (!data || !data.admins) {
-      setErr("Sistema nao inicializado");
-      setLoading(false);
-      return;
-    }
+    if (!data) { setLoginErr("Sistema não inicializado"); setLoginLoading(false); return; }
+
     const hashed = hashPin(p);
-    const admin = data.admins.find(a => a.pin === hashed);
-    if (admin) {
-      setSuccess(true);
-      setTimeout(() => onLogin({...admin, loginAt:Date.now()}), 900);
-    } else {
-      setShake(true);
-      pinRef.current = ""; setPin(""); setErr("PIN incorreto");
-      setTimeout(() => setShake(false), 500);
+    const nLower = n.toLowerCase().trim();
+
+    function nomeMatch(cadastrado, digitado) {
+      const a = cadastrado.toLowerCase().trim();
+      const d = digitado.toLowerCase().trim();
+      if (a === d) return true;
+      if (a.split(" ")[0] === d.split(" ")[0]) return true;
+      if (a.includes(d)) return true;
+      if (d.includes(a.split(" ")[0])) return true;
+      return false;
     }
-    setLoading(false);
+
+    // 1. Buscar em admins (Fabricio + admins promovidos)
+    const admin = (data.admins||[]).find(a => a.pin === hashed && nomeMatch(a.nome, n));
+
+    // 2. Buscar em users (usuários comuns cadastrados)
+    const user = !admin && (data.users||[]).find(u => u.pin === hashed && nomeMatch(u.nome, n));
+
+    const encontrado = admin || user;
+
+    if (encontrado) {
+      setSuccess(true);
+      setTimeout(() => onLogin({...encontrado, loginAt:Date.now()}), 800);
+    } else {
+      setLoginErr("Nome ou PIN incorretos. Verifique e tente novamente.");
+    }
+    setLoginLoading(false);
   }
 
-  // Background compartilhado
+  // ── Cadastro: salvar em users — entra direto sem aprovação ─────────────────
+  async function handleCadastro() {
+    setCadErr("");
+    const n = cadForm.nome.trim();
+    if (!n || n.length < 3)               { setCadErr("Nome completo obrigatório"); return; }
+    if (!cadForm.nascimento)              { setCadErr("Data de nascimento obrigatória"); return; }
+    if (!cadForm.sexo)                    { setCadErr("Selecione o sexo"); return; }
+    if (!cadForm.telefone || cadForm.telefone.replace(/\D/g,"").length < 10) { setCadErr("Telefone inválido"); return; }
+    if (cadForm.pin.length < 4)           { setCadErr("PIN deve ter ao menos 4 dígitos"); return; }
+    if (cadForm.pin !== cadForm.confirmar){ setCadErr("PINs não coincidem"); return; }
+    if (!cadForm.lgpd)                    { setCadErr("Aceite os termos para continuar"); return; }
+
+    const data = authRef.current;
+    // Checar duplicidade em admins e users
+    const nLower = n.toLowerCase();
+    const existeAdmin = (data.admins||[]).find(a => a.nome.toLowerCase() === nLower);
+    if (existeAdmin) { setCadErr("Já existe um usuário com esse nome."); return; }
+    const existeUser = (data.users||[]).find(u => u.nome.toLowerCase() === nLower);
+    if (existeUser) { setCadErr("Já existe um usuário com esse nome."); return; }
+
+    const novo = {
+      id: Date.now(),
+      nome: n,
+      cpf: cadForm.cpf,
+      nascimento: cadForm.nascimento,
+      sexo: cadForm.sexo,
+      estadoCivil: cadForm.estadoCivil,
+      telefone: cadForm.telefone,
+      email: cadForm.email,
+      cidade: cadForm.cidade,
+      cargo: cadForm.cargo || "Membro",
+      ministerio: cadForm.ministerio || "Nenhum",
+      pin: hashPin(cadForm.pin),
+      nivel: "user",
+      cadastroCompleto: true,
+      cadastradoEm: new Date().toLocaleString("pt-BR")
+    };
+    data.users = [...(data.users||[]), novo];
+    try { await storageSet("church_auth", JSON.stringify(data)); } catch(e) {}
+
+    // ── Criar membro na lista da igreja ──────────────────────────────────────
+    try {
+      const memberId = novo.id;
+      const novoMembro = {
+        id: memberId,
+        nome: n,
+        cpf: cadForm.cpf || "",
+        nascimento: cadForm.nascimento || "",
+        sexo: cadForm.sexo || "",
+        estadoCivil: cadForm.estadoCivil || "",
+        telefone: cadForm.telefone || "",
+        email: cadForm.email || "",
+        endereco: "",
+        cidade: cadForm.cidade || "",
+        cep: "",
+        cargo: cadForm.cargo || "Membro",
+        ministerio: cadForm.ministerio || "Nenhum",
+        dataBatismo: "",
+        dataMembresia: new Date().toISOString().slice(0,10),
+        conjugeNome: "",
+        filhos: "",
+        foto: null,
+        ativo: true,
+        observacoes: "",
+        historicoSaida: []
+      };
+      // Tentar Firebase primeiro
+      let membros = [];
+      try {
+        const fbData = await fbGet("church/members");
+        if (fbData && Array.isArray(fbData)) membros = fbData;
+        else {
+          const local = await loadEncrypted("church_members");
+          if (local) membros = local;
+        }
+      } catch(e2) {
+        try { const local = await loadEncrypted("church_members"); if(local) membros = local; } catch(e3) {}
+      }
+      const listAtualizada = [...membros, novoMembro];
+      await fbSet("church/members", listAtualizada);
+      await saveEncrypted("church_members", listAtualizada);
+    } catch(e) {}
+
+    setCadOk(true);
+  }
+
+  // ── Background ─────────────────────────────────────────────────────────────
   const BG = (
     <div style={{position:"absolute",inset:0,overflow:"hidden",pointerEvents:"none"}}>
-      {/* Gradiente de fundo */}
       <div style={{position:"absolute",inset:0,background:"linear-gradient(175deg,#f8f8f8 0%,#f0f0f0 40%,#ebebeb 70%,#f5f5f5 100%)"}} />
-      {/* Aurora sutil */}
       <div style={{position:"absolute",top:"-20%",left:"30%",width:"60%",height:"60%",borderRadius:"50%",background:"radial-gradient(ellipse,rgba(139,50,48,0.08) 0%,transparent 70%)",filter:"blur(40px)"}} />
-      <div style={{position:"absolute",bottom:"0%",right:"10%",width:"40%",height:"40%",borderRadius:"50%",background:"radial-gradient(ellipse,rgba(139,50,48,0.05) 0%,transparent 70%)",filter:"blur(30px)"}} />
-      {/* Estrelas */}
       {STARS.map(s => (
-        <div key={s.id} style={{
-          position:"absolute", left:s.x+"%", top:s.y+"%",
-          width:s.s, height:s.s, borderRadius:"50%",
-          background:"#8b3230",
-          opacity:s.op*0.3,
-          animation:`starTwinkle ${s.dur}s ${s.delay}s ease-in-out infinite`,
-          boxShadow: s.s>2 ? "0 0 4px rgba(255,255,255,0.8)" : "none",
-        }} />
+        <div key={s.id} style={{position:"absolute",left:s.x+"%",top:s.y+"%",width:s.s,height:s.s,borderRadius:"50%",
+          background:"#8b3230",opacity:s.op*0.3,animation:`starTwinkle ${s.dur}s ${s.delay}s ease-in-out infinite`}} />
       ))}
     </div>
   );
 
   if (!ready) return (
     <div style={{minHeight:"100vh",background:"#f5f5f5",display:"flex",alignItems:"center",justifyContent:"center",position:"relative"}}>
-      <style>{LOGIN_CSS}</style>
-      {BG}
-      <div style={{width:36,height:36,borderRadius:"50%",border:"2.5px solid rgba(255,255,255,0.08)",borderTopColor:"rgba(96,165,250,0.7)",animation:"spinLoader 0.8s linear infinite",position:"relative",zIndex:1}} />
+      <style>{LOGIN_CSS}</style>{BG}
+      <div style={{width:36,height:36,borderRadius:"50%",border:"2.5px solid #ddd",borderTopColor:"#8b3230",animation:"spinLoader 0.8s linear infinite"}} />
     </div>
   );
 
-  // ─── TELA DE BLOQUEIO ───────────────────────────────────────────────────────
   if (phase === "lock") {
+    const LOCK_SECS = 2;
+    const pct = ((LOCK_SECS - lockCount) / LOCK_SECS) * 100;
     return (
-      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"space-between",padding:"64px 24px 56px",fontFamily:"Inter,system-ui,sans-serif",position:"relative",overflow:"hidden"}}>
-        <style>{LOGIN_CSS}</style>
-        {BG}
-
-        {/* Espaço superior */}
-        <div/>
-
-        {/* Centro: icone da igreja */}
-        <div style={{textAlign:"center",animation:"fadeUp 0.7s 0.15s ease both",zIndex:1}}>
-          <div style={{
-            width:140, height:140, borderRadius:36,
-            background:"#fff",
-            border:"2px solid rgba(139,50,48,0.15)",
-            boxShadow:"0 8px 40px rgba(139,50,48,0.18)",
-            display:"flex",alignItems:"center",justifyContent:"center",
-            margin:"0 auto 16px",
-            animation:"glowPulse 3s ease-in-out infinite",
-          }}><img src={LOGO_B64} style={{width:110,height:110,objectFit:"contain"}} alt="Logo"/></div>
-          <div style={{color:"#8b3230",fontWeight:700,fontSize:17,letterSpacing:0.5}}>Assembleia de Deus</div>
-          <div style={{color:"#aaa",fontSize:12,marginTop:4,letterSpacing:2,textTransform:"uppercase"}}>Diadema</div>
+      <div onClick={()=>setPhase("login")} style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",
+        justifyContent:"center",fontFamily:"Inter,system-ui,sans-serif",position:"relative",overflow:"hidden",cursor:"pointer"}}>
+        <style>{LOGIN_CSS}</style>{BG}
+        {/* Barra de progresso no topo */}
+        <div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"rgba(139,50,48,0.1)",zIndex:10}}>
+          <div style={{height:"100%",background:"linear-gradient(90deg,#8b3230,#c9a84c)",width:pct+"%",transition:"width 1s linear"}}/>
         </div>
-
-        {/* Botão desbloquear */}
-        <div style={{animation:"fadeUp 0.7s 0.3s ease both",zIndex:1,textAlign:"center"}}>
-          <button className="unlock-pill" onClick={()=>setPhase("pin")} style={{
-            background:"#fff",
-            border:"1px solid rgba(139,50,48,0.2)",
-            boxShadow:"0 2px 16px rgba(0,0,0,0.08)",
-            borderRadius:50,
-            padding:"14px 32px",
-            color:"#8b3230",
-            fontSize:14, fontWeight:500, cursor:"pointer",
-            display:"inline-flex", alignItems:"center", gap:10,
-            transition:"all 0.2s", letterSpacing:0.3,
-          }}>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{opacity:0.7,color:"#8b3230"}}>
-              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-            </svg>
-            Toque para desbloquear
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{animation:"arrowDrift 1.8s ease-in-out infinite",opacity:0.6,color:"#8b3230"}}>
-              <polyline points="9 18 15 12 9 6"/>
-            </svg>
-          </button>
-          <div style={{color:"#ccc",fontSize:11,marginTop:22,letterSpacing:2}}>
-            ● ● ●
+        {/* Logo centralizado */}
+        <div style={{textAlign:"center",animation:"fadeUp 0.7s 0.1s ease both",zIndex:1}}>
+          <div style={{width:150,height:150,borderRadius:38,background:"#fff",border:"2px solid rgba(139,50,48,0.15)",
+            boxShadow:"0 8px 40px rgba(139,50,48,0.18)",display:"flex",alignItems:"center",justifyContent:"center",
+            margin:"0 auto 20px",animation:"glowPulse 3s ease-in-out infinite"}}>
+            <img src={LOGO_B64} style={{width:116,height:116,objectFit:"contain"}} alt="Logo"/>
           </div>
+          <div style={{color:"#8b3230",fontWeight:700,fontSize:18,letterSpacing:0.5}}>Assembleia de Deus</div>
+          <div style={{color:"#aaa",fontSize:12,marginTop:5,letterSpacing:3,textTransform:"uppercase"}}>Diadema</div>
+        </div>
+        {/* Bem-vindo */}
+        <div style={{animation:"fadeUp 0.7s 0.4s ease both",zIndex:1,textAlign:"center",marginTop:32}}>
+          <div style={{color:"#8b3230",fontSize:22,fontWeight:300,letterSpacing:3}}>Bem-vindo</div>
         </div>
       </div>
     );
   }
 
-  // ─── TELA DE PIN ────────────────────────────────────────────────────────────
-  const KEY_LETTERS = ["","ABC","DEF","GHI","JKL","MNO","PQRS","TUV","WXYZ"];
+  // ── TELA DE CADASTRO ──────────────────────────────────────────────────────────
+  if (phase === "cadastro") return (
+    <div style={{minHeight:"100vh",background:"#f5f5f5",fontFamily:"Inter,system-ui,sans-serif",position:"relative",overflow:"hidden"}}>
+      <style>{LOGIN_CSS}</style>{BG}
+      <div style={{maxWidth:440,margin:"0 auto",padding:"24px 20px 60px",position:"relative",zIndex:1}}>
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}>
+          <button onClick={()=>{setPhase("login");setCadErr("");setCadOk(false);setCadStep(1);}} style={{
+            background:"#ececec",border:"1px solid #ddd",borderRadius:20,color:"#888",padding:"6px 14px",
+            fontSize:12,cursor:"pointer",display:"flex",alignItems:"center",gap:5
+          }}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+            Voltar
+          </button>
+          <div>
+            <div style={{fontWeight:700,fontSize:15,color:"#1a1a1a"}}>Solicitar Acesso</div>
+            <div style={{fontSize:11,color:"#888"}}>Passo {cadStep} de 2</div>
+          </div>
+        </div>
 
+        {cadOk ? (
+          <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:14,padding:"28px 20px",textAlign:"center"}}>
+            <div style={{fontSize:48,marginBottom:12}}>✅</div>
+            <div style={{fontWeight:700,fontSize:16,color:"#15803d",marginBottom:8}}>Solicitação enviada!</div>
+            <div style={{fontSize:13,color:"#166534",lineHeight:1.7}}>
+              Cadastro realizado com sucesso!<br/>
+              Agora entre com seu nome e PIN.
+            </div>
+            <button onClick={()=>{setPhase("login");setCadOk(false);setCadStep(1);setCadForm({nome:"",cpf:"",nascimento:"",sexo:"",estadoCivil:"",telefone:"",email:"",cidade:"",cargo:"Membro",ministerio:"Nenhum",pin:"",confirmar:"",lgpd:false});}} style={{
+              marginTop:20,padding:"11px 28px",borderRadius:20,border:"none",
+              background:"linear-gradient(135deg,#742a28,#5c1a18)",color:"#fff",fontWeight:600,fontSize:13,cursor:"pointer"
+            }}>Ir para o login →</button>
+          </div>
+        ) : cadStep === 1 ? (
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{background:"#fff",borderRadius:14,padding:"18px 16px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div style={{fontWeight:700,fontSize:13,color:"#374151",marginBottom:14,paddingBottom:10,borderBottom:"1px solid #f1f5f9"}}>📋 Dados Pessoais</div>
+              <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                {[
+                  {label:"Nome completo *", key:"nome", type:"text", placeholder:"Seu nome completo"},
+                  {label:"CPF", key:"cpf", type:"text", placeholder:"000.000.000-00"},
+                  {label:"Data de nascimento *", key:"nascimento", type:"date"},
+                  {label:"Telefone *", key:"telefone", type:"tel", placeholder:"(11) 99999-9999"},
+                  {label:"E-mail", key:"email", type:"email", placeholder:"seu@email.com"},
+                  {label:"Cidade", key:"cidade", type:"text", placeholder:"Cidade"},
+                ].map(f => (
+                  <div key={f.key}>
+                    <label style={{fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,display:"block",textTransform:"uppercase",letterSpacing:0.3}}>{f.label}</label>
+                    <input type={f.type} placeholder={f.placeholder||""}
+                      style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none",background:"#f8fafc"}}
+                      value={cadForm[f.key]}
+                      onChange={e=>{
+                        let v = e.target.value;
+                        if(f.key==="cpf") v=fCPF(v);
+                        if(f.key==="telefone") v=fTel(v);
+                        setCadForm(cf=>({...cf,[f.key]:v}));setCadErr("");
+                      }}
+                    />
+                  </div>
+                ))}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,display:"block",textTransform:"uppercase",letterSpacing:0.3}}>Sexo *</label>
+                    <select style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none",background:"#f8fafc",cursor:"pointer"}}
+                      value={cadForm.sexo} onChange={e=>{setCadForm(cf=>({...cf,sexo:e.target.value}));setCadErr("");}}>
+                      <option value="">Selecione</option>
+                      <option>Masculino</option><option>Feminino</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,display:"block",textTransform:"uppercase",letterSpacing:0.3}}>Estado Civil</label>
+                    <select style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none",background:"#f8fafc",cursor:"pointer"}}
+                      value={cadForm.estadoCivil} onChange={e=>setCadForm(cf=>({...cf,estadoCivil:e.target.value}))}>
+                      <option value="">Selecione</option>
+                      <option>Solteiro(a)</option><option>Casado(a)</option><option>Divorciado(a)</option><option>Viúvo(a)</option>
+                    </select>
+                  </div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,display:"block",textTransform:"uppercase",letterSpacing:0.3}}>Cargo</label>
+                    <select style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none",background:"#f8fafc",cursor:"pointer"}}
+                      value={cadForm.cargo} onChange={e=>setCadForm(cf=>({...cf,cargo:e.target.value}))}>
+                      {CARGOS.map(c=><option key={c}>{c}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,display:"block",textTransform:"uppercase",letterSpacing:0.3}}>Ministério</label>
+                    <select style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none",background:"#f8fafc",cursor:"pointer"}}
+                      value={cadForm.ministerio} onChange={e=>setCadForm(cf=>({...cf,ministerio:e.target.value}))}>
+                      {MINISTERIOS.map(m=><option key={m}>{m}</option>)}
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {cadErr && <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:"10px 12px",fontSize:12,color:"#dc2626"}}>❌ {cadErr}</div>}
+            <button onClick={()=>{
+              const n=cadForm.nome.trim();
+              if(!n||n.length<3){setCadErr("Nome completo obrigatório");return;}
+              if(!cadForm.nascimento){setCadErr("Data de nascimento obrigatória");return;}
+              if(!cadForm.sexo){setCadErr("Selecione o sexo");return;}
+              if(!cadForm.telefone||cadForm.telefone.replace(/\D/g,"").length<10){setCadErr("Telefone inválido");return;}
+              setCadErr("");setCadStep(2);
+            }} style={{width:"100%",padding:"14px",borderRadius:12,border:"none",
+              background:"linear-gradient(135deg,#742a28,#5c1a18)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",
+              boxShadow:"0 4px 16px rgba(116,42,40,0.3)"}}>Próximo →</button>
+          </div>
+        ) : (
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{background:"#fff",borderRadius:14,padding:"18px 16px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+              <div style={{fontWeight:700,fontSize:13,color:"#374151",marginBottom:14,paddingBottom:10,borderBottom:"1px solid #f1f5f9"}}>🔐 Criar PIN de Acesso</div>
+              <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                <div>
+                  <label style={{fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,display:"block",textTransform:"uppercase",letterSpacing:0.3}}>Criar PIN (4–6 dígitos) *</label>
+                  <input type="password" inputMode="numeric" maxLength={6}
+                    style={{width:"100%",padding:"12px 14px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:18,outline:"none",background:"#f8fafc",letterSpacing:8,textAlign:"center"}}
+                    value={cadForm.pin} onChange={e=>setCadForm(cf=>({...cf,pin:e.target.value.replace(/\D/g,"")}))}
+                    placeholder="• • • •" />
+                </div>
+                <div>
+                  <label style={{fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,display:"block",textTransform:"uppercase",letterSpacing:0.3}}>Confirmar PIN *</label>
+                  <input type="password" inputMode="numeric" maxLength={6}
+                    style={{width:"100%",padding:"12px 14px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:18,outline:"none",background:"#f8fafc",letterSpacing:8,textAlign:"center"}}
+                    value={cadForm.confirmar} onChange={e=>setCadForm(cf=>({...cf,confirmar:e.target.value.replace(/\D/g,"")}))}
+                    placeholder="• • • •" />
+                </div>
+                <label style={{display:"flex",alignItems:"flex-start",gap:10,cursor:"pointer",padding:"12px",borderRadius:8,background:"#f8fafc",border:"1px solid #e2e8f0"}}>
+                  <input type="checkbox" checked={cadForm.lgpd} onChange={e=>setCadForm(cf=>({...cf,lgpd:e.target.checked}))}
+                    style={{width:16,height:16,marginTop:2,accentColor:"#742a28",flexShrink:0}} />
+                  <span style={{fontSize:11,color:"#475569",lineHeight:1.6}}>
+                    Concordo com o uso dos meus dados pessoais pela Igreja conforme a <strong>LGPD</strong> (Lei 13.709/2018). As informações serão usadas exclusivamente para gestão eclesiástica.
+                  </span>
+                </label>
+              </div>
+            </div>
+            {cadErr && <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:"10px 12px",fontSize:12,color:"#dc2626"}}>❌ {cadErr}</div>}
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={()=>{setCadStep(1);setCadErr("");}} style={{flex:1,padding:"13px",borderRadius:12,border:"1px solid #e2e8f0",background:"#f8fafc",color:"#64748b",fontWeight:600,fontSize:13,cursor:"pointer"}}>← Voltar</button>
+              <button onClick={handleCadastro} style={{flex:2,padding:"13px",borderRadius:12,border:"none",
+                background:"linear-gradient(135deg,#742a28,#5c1a18)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",
+                boxShadow:"0 4px 16px rgba(116,42,40,0.3)"}}>Solicitar Acesso</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  // ── TELA DE LOGIN (nome + PIN em box único) ──────────────────────────────────
   return (
-    <div style={{minHeight:"100vh",background:"#f5f5f5",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"32px 24px",fontFamily:"Inter,system-ui,sans-serif",position:"relative",overflow:"hidden"}}>
-      <style>{LOGIN_CSS}</style>
-      {BG}
+    <div style={{minHeight:"100vh",background:"#f5f5f5",display:"flex",flexDirection:"column",alignItems:"center",
+      justifyContent:"center",padding:"32px 24px",fontFamily:"Inter,system-ui,sans-serif",position:"relative",overflow:"hidden"}}>
+      <style>{LOGIN_CSS}</style>{BG}
 
-      {/* Voltar */}
-      <button onClick={()=>{setPhase("lock");setPin("");pinRef.current="";setErr("");setSuccess(false);}} style={{
-        position:"absolute",top:24,left:20,
-        background:"#ececec",border:"1px solid #ddd",
-        borderRadius:20,color:"#888",
-        padding:"6px 14px",fontSize:12,cursor:"pointer",
-        display:"flex",alignItems:"center",gap:5,
-        transition:"all 0.15s",zIndex:10,
+      <button onClick={()=>setPhase("lock")} style={{
+        position:"absolute",top:24,left:20,background:"#ececec",border:"1px solid #ddd",borderRadius:20,
+        color:"#888",padding:"6px 14px",fontSize:12,cursor:"pointer",display:"flex",alignItems:"center",gap:5,zIndex:10
       }}>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="15 18 9 12 15 6"/></svg>
         Voltar
       </button>
 
       {success ? (
-        /* ── Sucesso ── */
         <div style={{textAlign:"center",animation:"successPop 0.5s ease both",zIndex:1}}>
-          <div style={{
-            width:80,height:80,borderRadius:"50%",
-            background:"linear-gradient(135deg,#059669,#10b981)",
-            display:"flex",alignItems:"center",justifyContent:"center",
-            margin:"0 auto 18px",
-            boxShadow:"0 0 0 12px rgba(5,150,105,0.15), 0 0 50px rgba(16,185,129,0.4)",
-          }}>
-            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="20 6 9 17 4 12"/>
-            </svg>
+          <div style={{width:80,height:80,borderRadius:"50%",background:"linear-gradient(135deg,#059669,#10b981)",
+            display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 18px",
+            boxShadow:"0 0 0 12px rgba(5,150,105,0.15),0 0 50px rgba(16,185,129,0.4)"}}>
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
           </div>
-          <div style={{color:"rgba(255,255,255,0.9)",fontWeight:600,fontSize:17}}>Bem-vindo!</div>
-          <div style={{color:"rgba(255,255,255,0.35)",fontSize:13,marginTop:5}}>Acessando o sistema...</div>
+          <div style={{color:"#1a1a1a",fontWeight:700,fontSize:17}}>Bem-vindo!</div>
+          <div style={{color:"#888",fontSize:13,marginTop:5}}>Acessando o sistema...</div>
         </div>
       ) : (
-        /* ── Teclado PIN ── */
-        <div style={{width:"100%",maxWidth:300,zIndex:1,animation:"slideUp 0.35s ease both"}}>
-
-          {/* Header */}
-          <div style={{textAlign:"center",marginBottom:36}}>
-            <div style={{width:52,height:52,borderRadius:16,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 14px"}}><img src={LOGO_B64} style={{width:38,height:38,objectFit:"contain"}} alt="Logo"/></div>
-            <div style={{color:"#1a1a1a",fontWeight:600,fontSize:16,letterSpacing:0.2}}>
-              Digite seu PIN
+        <div style={{width:"100%",maxWidth:360,zIndex:1,animation:"slideUp 0.35s ease both"}}>
+          {/* Logo */}
+          <div style={{textAlign:"center",marginBottom:28}}>
+            <div style={{width:72,height:72,borderRadius:20,background:"#fff",border:"2px solid rgba(139,50,48,0.12)",
+              boxShadow:"0 4px 20px rgba(139,50,48,0.15)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 14px",animation:"glowPulse 3s ease-in-out infinite"}}>
+              <img src={LOGO_B64} style={{width:54,height:54,objectFit:"contain"}} alt="Logo"/>
             </div>
-            <div style={{color:"#aaa",fontSize:12,marginTop:5}}>
-              Acesso restrito a administradores
-            </div>
+            <div style={{color:"#1a1a1a",fontWeight:700,fontSize:17}}>Bem-vindo</div>
+            <div style={{color:"#888",fontSize:12,marginTop:3}}>Entre com suas credenciais</div>
           </div>
 
-          {/* Dots indicadores */}
-          <div style={{animation:shake?"shake 0.4s ease":"none",marginBottom:40}}>
-            <div style={{display:"flex",gap:18,justifyContent:"center"}}>
-              {[0,1,2,3].map(i => (
-                <div key={i} style={{
-                  width:13,height:13,borderRadius:"50%",
-                  background: i < pin.length ? "#c9a84c" : "transparent",
-                  border:"2px solid",
-                  borderColor: i < pin.length ? "#c9a84c" : "rgba(255,255,255,0.18)",
-                  transition:"all 0.13s",
-                  boxShadow: i < pin.length ? "0 0 10px rgba(201,168,76,0.5)" : "none",
-                  animation: i === pin.length-1 && pin.length > 0 ? "dotPop 0.2s ease" : "none",
-                }} />
-              ))}
+          {/* BOX de login */}
+          <div style={{background:"#fff",borderRadius:16,padding:"20px 18px",boxShadow:"0 4px 24px rgba(0,0,0,0.08)",border:"1px solid rgba(139,50,48,0.08)",marginBottom:10}}>
+            <div style={{marginBottom:14}}>
+              <label style={{fontSize:11,fontWeight:700,color:"#64748b",display:"block",marginBottom:6,textTransform:"uppercase",letterSpacing:0.4}}>Nome</label>
+              <input
+                autoFocus
+                style={{width:"100%",padding:"12px 14px",borderRadius:10,border:"1.5px solid #e2e8f0",fontSize:14,
+                  outline:"none",background:"#f8fafc",color:"#1a1a1a",transition:"border 0.2s"}}
+                value={loginNome}
+                onChange={e=>{setLoginNome(e.target.value);setLoginErr("");}}
+                onKeyDown={e=>e.key==="Enter"&&document.getElementById("pin-input")?.focus()}
+                placeholder="Seu nome completo"
+                onFocus={e=>e.target.style.borderColor="#8b3230"}
+                onBlur={e=>e.target.style.borderColor="#e2e8f0"}
+              />
             </div>
-            <div style={{minHeight:18,textAlign:"center",marginTop:12}}>
-              {err && <div style={{color:"#f87171",fontSize:12,fontWeight:500,animation:"fadeUp 0.2s ease"}}>{err}</div>}
+            <div style={{marginBottom:8}}>
+              <label style={{fontSize:11,fontWeight:700,color:"#64748b",display:"block",marginBottom:6,textTransform:"uppercase",letterSpacing:0.4}}>PIN</label>
+              <input
+                id="pin-input"
+                type="password"
+                inputMode="numeric"
+                maxLength={6}
+                style={{width:"100%",padding:"12px 14px",borderRadius:10,border:"1.5px solid #e2e8f0",fontSize:18,
+                  outline:"none",background:"#f8fafc",color:"#1a1a1a",letterSpacing:10,textAlign:"center",transition:"border 0.2s"}}
+                value={loginPin}
+                onChange={e=>{setLoginPin(e.target.value.replace(/\D/g,""));setLoginErr("");}}
+                onKeyDown={e=>e.key==="Enter"&&tryLogin()}
+                placeholder="• • • •"
+                onFocus={e=>e.target.style.borderColor="#8b3230"}
+                onBlur={e=>e.target.style.borderColor="#e2e8f0"}
+              />
             </div>
+            {loginErr && <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:"9px 12px",fontSize:12,color:"#dc2626",marginBottom:4}}>❌ {loginErr}</div>}
           </div>
 
-          {/* Teclado estilo iPhone */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14,marginBottom:14}}>
-            {[1,2,3,4,5,6,7,8,9].map(n => (
-              <button key={n} className="lk-key" onClick={e=>press(String(n),e)} style={{
-                height:68, borderRadius:"50%",
-                background:"#e8e8e8",
-                border:"1px solid #d8d8d8",
-                color:"#1a1a1a",
-                display:"flex",flexDirection:"column",
-                alignItems:"center",justifyContent:"center",
-                gap:0, position:"relative", overflow:"hidden",
-              }}>
-                <span style={{fontSize:26,fontWeight:300,lineHeight:1.1,letterSpacing:-0.5}}>{n}</span>
-                <span style={{fontSize:8,letterSpacing:2,color:"#999",textTransform:"uppercase",marginTop:1}}>
-                  {KEY_LETTERS[n]}
-                </span>
-              </button>
-            ))}
-
-            {/* Linha final: [vazio] [0] [apagar] */}
-            <div style={{height:68}} />
-            <button className="lk-key" onClick={e=>press("0",e)} style={{
-              height:68, borderRadius:"50%",
-              background:"rgba(255,255,255,0.09)",
-              border:"none",
-              color:"#fff",
-              display:"flex",flexDirection:"column",
-              alignItems:"center",justifyContent:"center",
-            }}>
-              <span style={{fontSize:26,fontWeight:300,lineHeight:1.1}}>0</span>
-              <span style={{fontSize:8,color:"#999",letterSpacing:1}}>+</span>
-            </button>
-            <button className="lk-del" onClick={del} style={{
-              height:68, borderRadius:"50%",
-              background:"transparent", border:"none",
-              color:"#666",
-              display:"flex",alignItems:"center",justifyContent:"center",
-              cursor:"pointer",
-              transition:"opacity 0.12s",
-            }}>
-              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/>
-                <line x1="18" y1="9" x2="13" y2="14"/>
-                <line x1="13" y1="9" x2="18" y2="14"/>
-              </svg>
-            </button>
-          </div>
-
-          {/* Botão Entrar */}
-          <button className="lk-enter" onClick={()=>tryLogin()} disabled={pin.length < 4 || loading} style={{
-            width:"100%", padding:"16px",
-            borderRadius:50, border:"none",
-            background: pin.length >= 4
-              ? "linear-gradient(135deg,#742a28,#5c1a18)"
-              : "rgba(255,255,255,0.04)",
-            color: pin.length >= 4 ? "#fff" : "rgba(255,255,255,0.2)",
-            fontSize:15, fontWeight:600,
-            cursor: pin.length >= 4 ? "pointer" : "default",
-            transition:"all 0.25s",
-            letterSpacing:0.4,
-            boxShadow: pin.length >= 4 ? "0 4px 28px rgba(116,42,40,0.5)" : "none",
+          <button onClick={tryLogin} disabled={loginLoading} style={{
+            width:"100%",padding:"15px",borderRadius:12,border:"none",
+            background:"linear-gradient(135deg,#742a28,#5c1a18)",color:"#fff",fontSize:15,fontWeight:700,
+            cursor:"pointer",boxShadow:"0 4px 20px rgba(116,42,40,0.4)",letterSpacing:0.3,marginBottom:14,
+            opacity:loginLoading?0.7:1
           }}>
-            {loading
+            {loginLoading
               ? <span style={{display:"inline-flex",alignItems:"center",gap:8}}>
-                  <span style={{width:16,height:16,borderRadius:"50%",border:"2px solid rgba(255,255,255,0.3)",borderTopColor:"#fff",animation:"spinLoader 0.7s linear infinite",display:"inline-block"}} />
+                  <span style={{width:14,height:14,borderRadius:"50%",border:"2px solid rgba(255,255,255,0.3)",borderTopColor:"#fff",animation:"spinLoader 0.7s linear infinite",display:"inline-block"}}/>
                   Verificando...
                 </span>
               : "Entrar"
             }
           </button>
 
-          <div style={{textAlign:"center",marginTop:18,color:"#bbb",fontSize:11,letterSpacing:0.3}}>
-            PIN padrao: 1234 — altere no painel Admin
+          {/* Link cadastro */}
+          <div style={{textAlign:"center"}}>
+            <button onClick={()=>{setPhase("cadastro");setLoginErr("");setCadStep(1);}} style={{
+              background:"transparent",border:"none",color:"#742a28",fontSize:13,fontWeight:600,
+              cursor:"pointer",textDecoration:"underline",padding:"4px 8px"
+            }}>Primeiro acesso? Cadastre-se</button>
           </div>
         </div>
       )}
@@ -931,7 +1133,7 @@ function EscalasMinhas({eventos}) {
 // ════════════════════════════════════════════════════════════════════════════
 // SECRETARIA VIEW
 // ════════════════════════════════════════════════════════════════════════════
-function SecretariaView({members, showToast, secPage}) {
+function SecretariaView({members, setMembers, save, showToast, secPage}) {
   // ── Estado principal: seção ──
   const [secao, setSecao]   = useState("membros"); // membros | grupos | escalas
   // ── Sub-tabs por seção ──
@@ -1119,13 +1321,13 @@ function SecretariaView({members, showToast, secPage}) {
                 <span style={{background:"#f1f5f9",borderRadius:7,padding:"7px 14px",fontSize:12,color:"#64748b",fontWeight:700}}>{sorted.length} membros</span>
               </div>
               <div style={{background:"#fff",borderRadius:12,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",overflow:"hidden"}}>
-                <div style={{display:"grid",gridTemplateColumns:"44px 50px 1fr 90px 80px",gap:6,padding:"9px 14px",background:"#f8fafc",borderBottom:"2px solid #e2e8f0",fontSize:11,fontWeight:700,color:"#64748b"}}>
-                  <div>N</div><div>Foto</div><div>Nome</div><div>Cargo</div><div>Status</div>
+                <div style={{display:"grid",gridTemplateColumns:"40px 46px 1fr 88px 72px 80px",gap:6,padding:"9px 14px",background:"#f8fafc",borderBottom:"2px solid #e2e8f0",fontSize:11,fontWeight:700,color:"#64748b"}}>
+                  <div>N</div><div>Foto</div><div>Nome</div><div>Cargo</div><div>Status</div><div></div>
                 </div>
                 {sorted.length===0
                   ? <div style={{textAlign:"center",padding:40,color:"#94a3b8"}}>Nenhum membro</div>
                   : sorted.map((m,i)=>(
-                  <div key={m.id} style={{display:"grid",gridTemplateColumns:"44px 50px 1fr 90px 80px",gap:6,padding:"9px 14px",borderBottom:"1px solid #f1f5f9",alignItems:"center",background:i%2===0?"#fff":"#fafafa"}}>
+                  <div key={m.id} style={{display:"grid",gridTemplateColumns:"40px 46px 1fr 88px 72px 80px",gap:6,padding:"9px 14px",borderBottom:"1px solid #f1f5f9",alignItems:"center",background:i%2===0?"#fff":"#fafafa"}}>
                     <div style={{fontSize:11,color:"#94a3b8",fontWeight:700}}>{i+1}</div>
                     <div>{m.foto
                       ? <img src={m.foto} style={{width:36,height:36,borderRadius:"50%",objectFit:"cover"}} alt=""/>
@@ -1136,6 +1338,12 @@ function SecretariaView({members, showToast, secPage}) {
                     </div>
                     <div style={{fontSize:11,color:"#475569"}}>{m.cargo||"Membro"}</div>
                     <div><span style={{background:m.ativo?"#dcfce7":"#fee2e2",color:m.ativo?"#16a34a":"#dc2626",borderRadius:20,padding:"2px 8px",fontSize:10,fontWeight:700}}>{m.ativo?"Ativo":"Inativo"}</span></div>
+                    <div><button onClick={()=>{
+                      if(!window.confirm("Excluir "+m.nome+" permanentemente? Esta ação não pode ser desfeita.")) return;
+                      const nova = members.filter(x=>x.id!==m.id);
+                      setMembers(nova); save(nova);
+                      showToast("Membro excluído.");
+                    }} style={{background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:6,padding:"4px 9px",fontSize:11,fontWeight:700,cursor:"pointer"}}>🗑 Excluir</button></div>
                   </div>
                 ))}
               </div>
@@ -1461,19 +1669,24 @@ function SecretariaView({members, showToast, secPage}) {
 function AdminView({currentUser, showToast, members, setMembers, save}) {
   const [sub, setSub] = useState("dashboard");
   const [admins, setAdmins] = useState([]);
+  const [authData, setAuthData] = useState(null);
   const [saidas, setSaidas] = useState([]);
   const [audit, setAudit] = useState([]);
   const [modalAdmin, setModalAdmin] = useState(false);
   const [modalPin, setModalPin] = useState(false);
-  const [formAdmin, setFormAdmin] = useState({nome:"",pin:"",nivel:"admin"});
+  const [formAdmin, setFormAdmin] = useState({nome:"",pin:""});
   const [newPin, setNewPin] = useState("");
   const [confPin, setConfPin] = useState("");
 
   useEffect(() => {
     (async () => {
       try {
-        const ra = await window.storage.get("church_auth");
-        if (ra?.value) setAdmins(JSON.parse(ra.value).admins || []);
+        const ra = await storageGet("church_auth");
+        if (ra?.value) {
+          const parsed = JSON.parse(ra.value);
+          setAdmins(parsed.admins || []);
+          setAuthData(parsed);
+        }
         const rs = await window.storage.get("church_saidas");
         if (rs?.value) setSaidas(JSON.parse(rs.value));
         const rl = await window.storage.get("church_audit");
@@ -1484,9 +1697,9 @@ function AdminView({currentUser, showToast, members, setMembers, save}) {
 
   async function saveAdmins(list) {
     try {
-      const ra = await window.storage.get("church_auth");
+      const ra = await storageGet("church_auth");
       const d = ra?.value ? JSON.parse(ra.value) : {};
-      await window.storage.set("church_auth", JSON.stringify({...d, admins:list}));
+      await storageSet("church_auth", JSON.stringify({...d, admins:list}));
     } catch(e) {}
   }
 
@@ -1500,11 +1713,11 @@ function AdminView({currentUser, showToast, members, setMembers, save}) {
   async function criarAdmin() {
     if (!formAdmin.nome || formAdmin.pin.length < 4) { showToast("Nome e PIN minimo 4 digitos", "error"); return; }
     if (!/^\d+$/.test(formAdmin.pin)) { showToast("PIN so numeros", "error"); return; }
-    const novo = {id:Date.now(), nome:formAdmin.nome, pin:hashPin(formAdmin.pin), nivel:formAdmin.nivel};
+    const novo = {id:Date.now(), nome:formAdmin.nome, pin:hashPin(formAdmin.pin), nivel:"admin"};
     const updated = [...admins, novo];
     setAdmins(updated); await saveAdmins(updated);
     await addAudit("Novo admin criado", formAdmin.nome);
-    showToast("Admin criado!"); setModalAdmin(false); setFormAdmin({nome:"",pin:"",nivel:"admin"});
+    showToast("Admin criado!"); setModalAdmin(false); setFormAdmin({nome:"",pin:""});
   }
 
   async function removerAdmin(id) {
@@ -1599,7 +1812,7 @@ function AdminView({currentUser, showToast, members, setMembers, save}) {
   return (
     <div>
       <div style={{display:"flex",gap:4,marginBottom:18,background:"#fff",borderRadius:12,padding:6,boxShadow:"0 1px 4px rgba(0,0,0,0.06)",flexWrap:"wrap"}}>
-        {[{id:"dashboard",l:"Painel"},{id:"saidas",l:`Saidas${pendentes.length?" ("+pendentes.length+")":""}`},{id:"admins",l:"Admins"},{id:"audit",l:"Auditoria"}].map(t => (
+        {[{id:"dashboard",l:"Painel"},{id:"saidas",l:`Saidas${pendentes.length?" ("+pendentes.length+")":""}`},{id:"admins",l:`Admins${(authData?.users||[]).length > 0 ? " ("+authData.users.length+" 👥)" : ""}`},{id:"audit",l:"Auditoria"}].map(t => (
           <button key={t.id} onClick={() => setSub(t.id)} style={{padding:"7px 16px",border:"none",cursor:"pointer",fontWeight:600,fontSize:13,borderRadius:8,background:sub===t.id?"linear-gradient(135deg,#7c3aed,#6d28d9)":"transparent",color:sub===t.id?"#fff":"#64748b",transition:"all 0.2s"}}>
             {t.l}
           </button>
@@ -1702,6 +1915,51 @@ function AdminView({currentUser, showToast, members, setMembers, save}) {
             </Card>
           )}
 
+          {/* ── USUÁRIOS: promover a admin ── */}
+          {(() => {
+            const users = authData?.users || [];
+            if (users.length === 0) return null;
+            return (
+              <Card style={{marginBottom:16}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14}}>
+                  <span style={{fontSize:18}}>👥</span>
+                  <div style={{fontWeight:700,fontSize:14,color:"#1e293b"}}>
+                    Usuários Cadastrados ({users.length})
+                  </div>
+                  <div style={{fontSize:11,color:"#64748b",marginLeft:4}}>— promova a admin quando quiser</div>
+                </div>
+                {users.map(u => (
+                  <div key={u.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",
+                    borderBottom:"1px solid #f1f5f9"}}>
+                    <div style={{width:38,height:38,borderRadius:"50%",background:"linear-gradient(135deg,#2563eb,#1d4ed8)",
+                      display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,color:"#fff",fontWeight:700,flexShrink:0}}>
+                      {u.nome[0].toUpperCase()}
+                    </div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontWeight:600,fontSize:13,color:"#1e293b"}}>{u.nome}</div>
+                      <div style={{fontSize:11,color:"#64748b"}}>{u.cargo||"Membro"} · {u.cadastradoEm||""}</div>
+                    </div>
+                    <button onClick={async()=>{
+                      const r = await storageGet("church_auth");
+                      if(!r?.value) return;
+                      const auth = JSON.parse(r.value);
+                      const promovido = {...u, nivel:"admin", cadastroCompleto:true};
+                      auth.admins = [...(auth.admins||[]), promovido];
+                      auth.users = (auth.users||[]).filter(x=>x.id!==u.id);
+                      await storageSet("church_auth", JSON.stringify(auth));
+                      setAuthData({...auth}); setAdmins(auth.admins||[]);
+                      showToast("✅ "+u.nome+" promovido a admin!");
+                    }} style={{padding:"6px 14px",borderRadius:8,border:"none",
+                      background:"linear-gradient(135deg,#7c3aed,#6d28d9)",color:"#fff",
+                      fontWeight:700,fontSize:12,cursor:"pointer",flexShrink:0}}>
+                      ⬆️ Promover
+                    </button>
+                  </div>
+                ))}
+              </Card>
+            );
+          })()}
+
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}>
             <div style={{fontWeight:700,fontSize:15}}>Administradores</div>
             <div style={{display:"flex",gap:8}}>
@@ -1717,7 +1975,7 @@ function AdminView({currentUser, showToast, members, setMembers, save}) {
                 }
                 return <Btn color="gray" size="sm" onClick={() => setModalPin(true)}>Alterar meu PIN</Btn>;
               })()}
-              {currentUser.nivel==="super" && <Btn color="purple" size="sm" onClick={() => { setFormAdmin({nome:"",pin:"",nivel:"admin"}); setModalAdmin(true); }}>+ Novo Admin</Btn>}
+              {currentUser.nivel==="super" && <Btn color="purple" size="sm" onClick={() => { setFormAdmin({nome:"",pin:""}); setModalAdmin(true); }}>+ Novo Admin</Btn>}
             </div>
           </div>
           {admins.map(a => (
@@ -1775,7 +2033,7 @@ function AdminView({currentUser, showToast, members, setMembers, save}) {
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
             <Field label="Nome"><input style={INP} value={formAdmin.nome} onChange={e=>setFormAdmin(f=>({...f,nome:e.target.value}))} placeholder="Nome do admin" /></Field>
             <Field label="PIN (4-6 digitos)"><input type="password" inputMode="numeric" maxLength={6} style={INP} value={formAdmin.pin} onChange={e=>setFormAdmin(f=>({...f,pin:e.target.value.replace(/\D/g,"")}))} placeholder="****" /></Field>
-            <Field label="Nivel"><select style={SEL} value={formAdmin.nivel} onChange={e=>setFormAdmin(f=>({...f,nivel:e.target.value}))}><option value="admin">Admin</option><option value="super">Super Admin</option></select></Field>
+            {/* Nivel fixo: Admin — so o Super Admin existe como nivel superior */}
           </div>
           <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:18}}>
             <Btn color="gray" onClick={() => setModalAdmin(false)}>Cancelar</Btn>
@@ -3025,6 +3283,404 @@ function InfantilView({members, showToast}) {
 
 
 
+// ── PRIMEIRO CADASTRO ─────────────────────────────────────────────────────────
+async function markCadastroCompleto(userId) {
+  try {
+    const r = await storageGet("church_auth");
+    if (r?.value) {
+      const auth = JSON.parse(r.value);
+      auth.admins = auth.admins.map(a => a.id === userId ? {...a, cadastroCompleto:true} : a);
+      await storageSet("church_auth", JSON.stringify(auth));
+    }
+  } catch(e) {}
+}
+
+function PrimeiroCadastro({ user, onComplete, onLogout, members, setMembers, save }) {
+  const [modo, setModo] = useState("jatem"); // "jatem" | "novo"
+  const [form, setForm] = useState({
+    nome: user.nome !== "Administrador" ? user.nome : "",
+    telefone: "", nascimento: "", foto: null,
+    endereco: "", numero: "", bairro: "", cidade: "", cep: "",
+    cargo: "Membro", ministerio: "Nenhum",
+  });
+  const [jaForm, setJaForm]     = useState({ nome: "" });
+  const [jaErr, setJaErr]       = useState("");
+  const [jaOk, setJaOk]         = useState(false);
+  const [aceitouTermos, setAceitouTermos] = useState(false);
+  const [novoPIN, setNovoPIN]   = useState({ pin:"", confirmar:"" });
+  const [jaChecking, setJaChecking] = useState(false);
+  const [errors, setErrors]     = useState({});
+  const [showLeave, setShowLeave] = useState(false);
+  const [saving, setSaving]     = useState(false);
+  const [welcome, setWelcome]   = useState(false);
+  const [welcomeName, setWelcomeName] = useState("");
+  const [welcomeFoto, setWelcomeFoto] = useState(null);
+  const hf = (k,v) => { setForm(f=>({...f,[k]:v})); setErrors(e=>({...e,[k]:undefined})); };
+
+  useEffect(() => {
+    const handler = e => { e.preventDefault(); e.returnValue = ""; setShowLeave(true); };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
+  // ── VERIFICAR "JÁ SOU CADASTRADO" ──────────────────────────────────────────
+  async function verificarJaCadastrado() {
+    setJaErr("");
+    const nomeBusca = jaForm.nome.trim().toLowerCase();
+    if (!nomeBusca) { setJaErr("Informe seu nome completo"); return; }
+    setJaChecking(true);
+
+    try {
+      // Você já autenticou com seu PIN na tela de acesso.
+      // Aqui só verificamos se você está na lista de membros.
+      let membrosAtual = members;
+      if (!membrosAtual || membrosAtual.length === 0) {
+        try {
+          const fbData = await fbGet("church/members");
+          if (fbData && Array.isArray(fbData)) membrosAtual = fbData;
+          else { const local = await loadEncrypted("church_members"); membrosAtual = local || []; }
+        } catch(e) { membrosAtual = []; }
+      }
+
+      const palavras = nomeBusca.split(" ").filter(p => p.length > 1);
+      const membro = membrosAtual.find(m =>
+        m.ativo && m.nome &&
+        palavras.every(p => m.nome.toLowerCase().includes(p))
+      );
+
+      if (!membro) {
+        setJaErr(`Nenhum membro encontrado com o nome "${jaForm.nome.trim()}". Verifique se digitou corretamente ou use "Cadastre-se".`);
+        setJaChecking(false); return;
+      }
+
+      // Encontrado → marcar como completo e entrar
+      setJaOk(true);
+      setWelcomeName(membro.nome);
+      setWelcomeFoto(membro.foto || null);
+      await markCadastroCompleto(user.id);
+      setWelcome(true);
+      setTimeout(() => onComplete({...user, cadastroCompleto:true}), 2600);
+    } catch(e) {
+      setJaErr("Erro ao verificar. Tente novamente.");
+    }
+    setJaChecking(false);
+  }
+
+  // ── NOVO CADASTRO ───────────────────────────────────────────────────────────
+  function validate() {
+    const e = {};
+    if (!form.nome.trim())                e.nome       = "Nome é obrigatório";
+    if (!form.telefone.replace(/\D/g,"")) e.telefone   = "Telefone é obrigatório";
+    if (!form.nascimento)                 e.nascimento = "Data de nascimento é obrigatória";
+    if (!form.foto)                       e.foto       = "Foto é obrigatória";
+    if (!form.endereco.trim())            e.endereco   = "Endereço é obrigatório";
+    if (!form.cidade.trim())              e.cidade     = "Cidade é obrigatória";
+    if (novoPIN.pin.length >= 4) {
+      if (novoPIN.pin !== novoPIN.confirmar) e.confirmarPIN = "Os PINs não coincidem";
+    } else if (novoPIN.pin.length > 0) {
+      e.pin = "PIN deve ter pelo menos 4 dígitos";
+    }
+    return e;
+  }
+
+  async function handleFoto(e) {
+    const file = e.target.files?.[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async ev => { const resized = await resizeFoto(ev.target.result); hf("foto", resized); };
+    reader.readAsDataURL(file);
+  }
+
+  async function handleSubmit() {
+    if (!aceitouTermos) { setErrors(e=>({...e,termos:"Você precisa aceitar os termos para continuar"})); return; }
+    const errs = validate(); setErrors(errs);
+    if (Object.keys(errs).length > 0) return;
+    setSaving(true);
+    try {
+      const enderecoFull = [form.endereco.trim(), form.numero.trim(), form.bairro.trim()].filter(Boolean).join(", ");
+      const newMember = { ...EMPTY_MEMBER, id: Date.now(),
+        nome: form.nome.trim(), telefone: form.telefone, nascimento: form.nascimento,
+        foto: form.foto, endereco: enderecoFull, cidade: form.cidade.trim(),
+        cep: form.cep, cargo: form.cargo, ministerio: form.ministerio,
+        ativo: true, dataMembresia: hoje(), _adminId: user.id };
+      const updated = [...members, newMember];
+      setMembers(updated); await save(updated);
+      await markCadastroCompleto(user.id);
+      // Se o usuário definiu um PIN novo, salvar
+      if (novoPIN.pin.length >= 4 && novoPIN.pin === novoPIN.confirmar) {
+        try {
+          const rp = await storageGet("church_auth");
+          if (rp?.value) {
+            const authP = JSON.parse(rp.value);
+            authP.admins = authP.admins.map(a =>
+              a.id === user.id ? {...a, pin: hashPin(novoPIN.pin), pinTrocado: true} : a
+            );
+            await storageSet("church_auth", JSON.stringify(authP));
+          }
+        } catch(ep) {}
+      }
+      setWelcomeName(newMember.nome);
+      setWelcomeFoto(newMember.foto);
+      setWelcome(true);
+      setTimeout(() => onComplete({...user, cadastroCompleto:true}), 2800);
+    } catch(e) { setSaving(false); }
+  }
+
+  // ── TELA BEM-VINDO ──────────────────────────────────────────────────────────
+  if (welcome) return (
+    <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#8b3230,#5c1a18)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:32}}>
+      <style>{`@keyframes successPop{0%{transform:scale(0.4);opacity:0}60%{transform:scale(1.1)}100%{transform:scale(1);opacity:1}} @keyframes spinLoader{to{transform:rotate(360deg)}}`}</style>
+      <div style={{textAlign:"center",animation:"successPop 0.5s ease both"}}>
+        <div style={{width:100,height:100,borderRadius:"50%",background:"rgba(255,255,255,0.15)",border:"3px solid rgba(255,255,255,0.4)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 24px",boxShadow:"0 0 40px rgba(255,255,255,0.2)"}}>
+          {welcomeFoto ? <img src={welcomeFoto} style={{width:94,height:94,borderRadius:"50%",objectFit:"cover"}} alt="foto"/> : <span style={{fontSize:40}}>✝</span>}
+        </div>
+        <div style={{color:"#fff",fontWeight:800,fontSize:26,marginBottom:8}}>Bem-vindo(a)!</div>
+        <div style={{color:"rgba(255,255,255,0.8)",fontSize:16,marginBottom:6}}>{welcomeName}</div>
+        <div style={{color:"rgba(255,255,255,0.55)",fontSize:13}}>Identidade verificada com sucesso.</div>
+        <div style={{color:"rgba(255,255,255,0.4)",fontSize:12,marginTop:20}}>Entrando no sistema...</div>
+        <div style={{width:36,height:36,borderRadius:"50%",border:"3px solid rgba(255,255,255,0.2)",borderTopColor:"rgba(255,255,255,0.8)",animation:"spinLoader 0.9s linear infinite",margin:"14px auto 0"}}/>
+      </div>
+    </div>
+  );
+
+  const ERR = {fontSize:11,color:"#dc2626",marginTop:3};
+  const haErr = k => errors[k] ? {borderColor:"#fca5a5"} : {};
+
+  return (
+    <div style={{minHeight:"100vh",background:"#f1f5f9",fontFamily:"system-ui,sans-serif"}}>
+      <style>{`@keyframes spinLoader{to{transform:rotate(360deg)}} @keyframes successPop{0%{transform:scale(0.4);opacity:0}60%{transform:scale(1.1)}100%{transform:scale(1);opacity:1}}`}</style>
+      {/* Header */}
+      <div style={{background:"linear-gradient(135deg,#742a28,#5c1a18)",padding:"18px 20px",display:"flex",alignItems:"center",gap:14,position:"sticky",top:0,zIndex:50,boxShadow:"0 2px 12px rgba(0,0,0,0.2)"}}>
+        <img src={LOGO_B64} style={{width:38,height:38,objectFit:"contain",borderRadius:8,background:"rgba(255,255,255,0.1)",padding:3}} alt="Logo"/>
+        <div>
+          <div style={{color:"#fff",fontWeight:700,fontSize:15}}>Verificação de Identidade</div>
+          <div style={{color:"rgba(255,255,255,0.65)",fontSize:11}}>Obrigatório para acessar o sistema</div>
+        </div>
+        <div style={{marginLeft:"auto",background:"rgba(255,255,255,0.12)",borderRadius:20,padding:"4px 12px",color:"rgba(255,255,255,0.8)",fontSize:11,fontWeight:600}}>1ª entrada</div>
+      </div>
+
+      {/* Abas */}
+      <div style={{background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex"}}>
+        <button onClick={()=>{setModo("jatem");setJaErr("");setErrors({});}} style={{
+          flex:1,padding:"14px 0",border:"none",cursor:"pointer",fontWeight:700,fontSize:13,
+          background:"transparent",borderBottom:modo==="jatem"?"3px solid #742a28":"3px solid transparent",
+          color:modo==="jatem"?"#742a28":"#64748b",transition:"all 0.15s"
+        }}>🔐 Já sou cadastrado</button>
+        <button onClick={()=>{setModo("novo");setJaErr("");setErrors({});}} style={{
+          flex:1,padding:"14px 0",border:"none",cursor:"pointer",fontWeight:700,fontSize:13,
+          background:"transparent",borderBottom:modo==="novo"?"3px solid #742a28":"3px solid transparent",
+          color:modo==="novo"?"#742a28":"#64748b",transition:"all 0.15s"
+        }}>📝 Cadastre-se</button>
+      </div>
+
+      <div style={{maxWidth:520,margin:"0 auto",padding:"24px 16px 40px"}}>
+
+        {/* ── ABA: JÁ SOU CADASTRADO ── */}
+        {modo === "jatem" && (
+          <div style={{display:"flex",flexDirection:"column",gap:16}}>
+            <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:12,padding:"14px 16px",fontSize:13,color:"#1d4ed8",lineHeight:1.6}}>
+              ✅ <b>Seu acesso foi verificado pelo PIN.</b><br/>
+              Agora confirme seu nome completo como está na lista de membros para liberar o sistema.
+            </div>
+
+            <Field label="Seu nome completo (como está no cadastro)">
+              <input style={INP} value={jaForm.nome} onChange={e=>{setJaForm(f=>({...f,nome:e.target.value}));setJaErr("");}}
+                placeholder="Ex: João da Silva"
+                onKeyDown={e=>e.key==="Enter"&&verificarJaCadastrado()} />
+            </Field>
+
+            {jaErr && (
+              <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:10,padding:"12px 14px",fontSize:13,color:"#dc2626",lineHeight:1.5}}>
+                ❌ {jaErr}
+              </div>
+            )}
+
+            <button onClick={verificarJaCadastrado} disabled={jaChecking || jaOk} style={{
+              width:"100%",padding:"14px",borderRadius:12,border:"none",
+              background:jaChecking||jaOk?"#94a3b8":"linear-gradient(135deg,#059669,#047857)",
+              color:"#fff",fontWeight:700,fontSize:14,cursor:jaChecking||jaOk?"not-allowed":"pointer",
+              boxShadow:"0 4px 16px rgba(5,150,105,0.3)",
+              display:"flex",alignItems:"center",justifyContent:"center",gap:8
+            }}>
+              {jaChecking
+                ? <><span style={{width:16,height:16,borderRadius:"50%",border:"2px solid rgba(255,255,255,0.3)",borderTopColor:"#fff",animation:"spinLoader 0.8s linear infinite",display:"inline-block"}}/> Verificando...</>
+                : jaOk ? "✅ Verificado!" : "🔍 Verificar e Entrar"
+              }
+            </button>
+
+            <button onClick={()=>setShowLeave(true)} style={{
+              width:"100%",padding:"10px",borderRadius:10,border:"1px solid #e2e8f0",
+              background:"#f8fafc",color:"#64748b",cursor:"pointer",fontSize:12,fontWeight:500
+            }}>Sair do sistema</button>
+          </div>
+        )}
+
+        {/* ── ABA: NOVO CADASTRO ── */}
+        {modo === "novo" && (
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{background:"#fef3c7",border:"1px solid #fde68a",borderRadius:10,padding:"10px 14px",fontSize:12,color:"#92400e"}}>
+              ⚠️ Preencha todos os campos obrigatórios (<b>*</b>) para acessar o sistema.
+            </div>
+
+            {/* Foto */}
+            <div style={{textAlign:"center"}}>
+              <div style={{position:"relative",display:"inline-block"}}>
+                <div style={{width:90,height:90,borderRadius:"50%",overflow:"hidden",border:errors.foto?"3px solid #fca5a5":"3px solid #e2e8f0",background:"#f8fafc",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer"}}
+                  onClick={()=>document.getElementById("foto-upload").click()}>
+                  {form.foto
+                    ? <img src={form.foto} style={{width:"100%",height:"100%",objectFit:"cover"}} alt="foto"/>
+                    : <div style={{textAlign:"center",color:"#94a3b8"}}><div style={{fontSize:28}}>📷</div><div style={{fontSize:10,marginTop:2}}>Foto *</div></div>}
+                </div>
+                <input id="foto-upload" type="file" accept="image/*" style={{display:"none"}} onChange={handleFoto}/>
+                <div style={{position:"absolute",bottom:0,right:0,width:26,height:26,borderRadius:"50%",background:"#742a28",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",border:"2px solid #fff"}}
+                  onClick={()=>document.getElementById("foto-upload").click()}>
+                  <span style={{color:"#fff",fontSize:12}}>+</span>
+                </div>
+              </div>
+              {errors.foto && <div style={{...ERR,textAlign:"center"}}>{errors.foto}</div>}
+            </div>
+
+            <Field label="Nome completo *">
+              <input style={{...INP,...haErr("nome")}} value={form.nome} onChange={e=>hf("nome",e.target.value)} placeholder="Seu nome completo"/>
+              {errors.nome && <div style={ERR}>{errors.nome}</div>}
+            </Field>
+            <Field label="Telefone / WhatsApp *">
+              <input style={{...INP,...haErr("telefone")}} value={form.telefone} onChange={e=>hf("telefone",fTel(e.target.value))} placeholder="(11) 99999-9999" inputMode="tel"/>
+              {errors.telefone && <div style={ERR}>{errors.telefone}</div>}
+            </Field>
+            <Field label="Data de Nascimento *">
+              <input type="date" style={{...INP,...haErr("nascimento")}} value={form.nascimento} onChange={e=>hf("nascimento",e.target.value)}/>
+              {errors.nascimento && <div style={ERR}>{errors.nascimento}</div>}
+            </Field>
+            <Field label="Endereço (Rua/Av.) *">
+              <input style={{...INP,...haErr("endereco")}} value={form.endereco} onChange={e=>hf("endereco",e.target.value)} placeholder="Rua ou Avenida"/>
+              {errors.endereco && <div style={ERR}>{errors.endereco}</div>}
+            </Field>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Field label="Número"><input style={INP} value={form.numero} onChange={e=>hf("numero",e.target.value)} placeholder="123"/></Field>
+              <Field label="Bairro"><input style={INP} value={form.bairro} onChange={e=>hf("bairro",e.target.value)} placeholder="Bairro"/></Field>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10}}>
+              <Field label="Cidade *">
+                <input style={{...INP,...haErr("cidade")}} value={form.cidade} onChange={e=>hf("cidade",e.target.value)} placeholder="Diadema"/>
+                {errors.cidade && <div style={ERR}>{errors.cidade}</div>}
+              </Field>
+              <Field label="CEP">
+                <input style={{...INP,width:110}} value={form.cep} onChange={e=>hf("cep",fCEP(e.target.value))} placeholder="09000-000" inputMode="numeric"/>
+              </Field>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Field label="Cargo *">
+                <select style={SEL} value={form.cargo} onChange={e=>hf("cargo",e.target.value)}>
+                  {CARGOS.map(c=><option key={c}>{c}</option>)}
+                </select>
+              </Field>
+              <Field label="Ministério *">
+                <select style={SEL} value={form.ministerio} onChange={e=>hf("ministerio",e.target.value)}>
+                  {MINISTERIOS.map(m=><option key={m}>{m}</option>)}
+                </select>
+              </Field>
+            </div>
+
+            {/* ── Definir PIN ── */}
+            <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:12,padding:"14px 16px"}}>
+              <div style={{fontWeight:700,fontSize:13,color:"#15803d",marginBottom:10}}>🔐 Defina seu PIN de acesso</div>
+              <div style={{fontSize:12,color:"#166534",marginBottom:12,lineHeight:1.5}}>
+                Crie um PIN de 4 a 6 dígitos para entrar no sistema. Se deixar em branco, o PIN inicial configurado pelo administrador será mantido.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                <Field label="Novo PIN (opcional)">
+                  <input type="password" inputMode="numeric" maxLength={6} style={{...INP,...(errors.pin?{borderColor:"#fca5a5"}:{})}}
+                    value={novoPIN.pin}
+                    onChange={e=>{ setNovoPIN(v=>({...v,pin:e.target.value.replace(/\D/g,"")})); setErrors(er=>({...er,pin:undefined,confirmarPIN:undefined})); }}
+                    placeholder="••••" />
+                  {errors.pin && <div style={{fontSize:11,color:"#dc2626",marginTop:3}}>{errors.pin}</div>}
+                </Field>
+                <Field label="Confirmar PIN">
+                  <input type="password" inputMode="numeric" maxLength={6} style={{...INP,...(errors.confirmarPIN?{borderColor:"#fca5a5"}:{})}}
+                    value={novoPIN.confirmar}
+                    onChange={e=>{ setNovoPIN(v=>({...v,confirmar:e.target.value.replace(/\D/g,"")})); setErrors(er=>({...er,confirmarPIN:undefined})); }}
+                    placeholder="••••" />
+                  {errors.confirmarPIN && <div style={{fontSize:11,color:"#dc2626",marginTop:3}}>{errors.confirmarPIN}</div>}
+                </Field>
+              </div>
+            </div>
+
+            {/* Checkbox de licença — desmarcado por padrão */}
+            <div style={{
+              background: errors.termos ? "#fef2f2" : "#f8fafc",
+              border: errors.termos ? "1px solid #fca5a5" : "1px solid #e2e8f0",
+              borderRadius:10, padding:"12px 14px",
+            }}>
+              <label style={{display:"flex",alignItems:"flex-start",gap:12,cursor:"pointer"}}>
+                <div onClick={()=>{setAceitouTermos(v=>!v);setErrors(e=>({...e,termos:undefined}));}} style={{
+                  width:22,height:22,borderRadius:6,flexShrink:0,marginTop:1,
+                  border: aceitouTermos ? "none" : "2px solid #cbd5e1",
+                  background: aceitouTermos ? "linear-gradient(135deg,#742a28,#5c1a18)" : "#fff",
+                  display:"flex",alignItems:"center",justifyContent:"center",
+                  transition:"all 0.15s",cursor:"pointer",
+                  boxShadow: aceitouTermos ? "0 2px 8px rgba(116,42,40,0.3)" : "none",
+                }}>
+                  {aceitouTermos && (
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                  )}
+                </div>
+                <div style={{fontSize:12,color:"#475569",lineHeight:1.6}}>
+                  <span style={{fontWeight:700,color:"#1e293b"}}>Li e aceito os termos de uso</span><br/>
+                  Confirmo que os dados informados são verdadeiros e autorizo o armazenamento conforme a <span style={{color:"#742a28",fontWeight:600}}>LGPD</span>.
+                </div>
+              </label>
+              {errors.termos && <div style={{fontSize:11,color:"#dc2626",marginTop:8,paddingLeft:34}}>⚠️ {errors.termos}</div>}
+            </div>
+
+            <button onClick={handleSubmit} disabled={saving} style={{
+              width:"100%",padding:"15px",borderRadius:12,border:"none",
+              background:saving?"#94a3b8":"linear-gradient(135deg,#742a28,#5c1a18)",
+              color:"#fff",fontWeight:700,fontSize:15,cursor:saving?"not-allowed":"pointer",
+              marginTop:4,boxShadow:"0 4px 16px rgba(116,42,40,0.35)",
+              display:"flex",alignItems:"center",justifyContent:"center",gap:8
+            }}>
+              {saving
+                ? <><span style={{width:18,height:18,borderRadius:"50%",border:"2px solid rgba(255,255,255,0.3)",borderTopColor:"#fff",animation:"spinLoader 0.8s linear infinite",display:"inline-block"}}/> Salvando...</>
+                : <>✅ Concluir Cadastro e Entrar</>}
+            </button>
+            <button onClick={()=>setShowLeave(true)} style={{
+              width:"100%",padding:"10px",borderRadius:10,border:"1px solid #e2e8f0",
+              background:"#f8fafc",color:"#64748b",cursor:"pointer",fontSize:12,fontWeight:500
+            }}>Sair do sistema</button>
+          </div>
+        )}
+      </div>
+
+      {/* Modal de aviso ao sair */}
+      {showLeave && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999,padding:20}}>
+          <div style={{background:"#fff",borderRadius:16,padding:28,maxWidth:360,width:"100%",textAlign:"center",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
+            <div style={{fontSize:44,marginBottom:12}}>🚫</div>
+            <div style={{fontWeight:800,fontSize:17,color:"#1e293b",marginBottom:8}}>Verificação incompleta!</div>
+            <div style={{color:"#475569",fontSize:13,lineHeight:1.6,marginBottom:22}}>
+              Você ainda não verificou sua identidade.<br/>
+              <b>Sair agora encerrará sua sessão.</b>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <button onClick={()=>setShowLeave(false)} style={{
+                padding:"12px",borderRadius:10,border:"none",
+                background:"linear-gradient(135deg,#742a28,#5c1a18)",
+                color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer"
+              }}>← Continuar verificação</button>
+              <button onClick={()=>{ setShowLeave(false); onLogout(); }} style={{
+                padding:"10px",borderRadius:10,border:"1px solid #fca5a5",
+                background:"#fef2f2",color:"#dc2626",fontWeight:600,fontSize:13,cursor:"pointer"
+              }}>Sair e encerrar sessão</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── APP ────────────────────────────────────────────────────────────────────────
 function App() {
   const [user, setUser] = useState(null);
@@ -3093,7 +3749,9 @@ function App() {
   }, []);
 
   if (!user) return <PinLogin onLogin={async u => {
-    setUser(u); setLoading(true);
+    // Super admin e admins aprovados têm acesso direto
+    const cadastroCompleto = u.nivel === "super" || u.cadastroCompleto === true;
+    setUser({...u, cadastroCompleto}); setLoading(true);
     // Registrar log de acesso
     try {
       const existing = await loadEncrypted("church_access_log") || [];
@@ -3103,16 +3761,39 @@ function App() {
     } catch(e) {}
   }} />;
 
+  // ── PRIMEIRO ACESSO: formulário de cadastro obrigatório ─────────────────────
+  if (user && !user.cadastroCompleto) {
+    return (
+      <PrimeiroCadastro
+        user={user}
+        onComplete={updatedUser => { setUser(updatedUser); setLoading(false); }}
+        onLogout={async () => {
+          try {
+            const existing = await loadEncrypted("church_access_log") || [];
+            const entry = {id:Date.now(), admin:user.nome, nivel:user.nivel, em:new Date().toLocaleString("pt-BR"), tipo:"logout"};
+            await saveEncrypted("church_access_log", [entry,...existing].slice(0,500));
+          } catch(e) {}
+          setUser(null);
+        }}
+        members={members}
+        setMembers={setMembers}
+        save={save}
+      />
+    );
+  }
+
+  const isAdmin = user?.nivel === "super" || user?.nivel === "admin";
   const anivHoje = members.filter(m => isAniv(m.nascimento) && m.ativo).length;
-  const NAVS = [
+  const NAVS_ALL = [
     {id:"membros",    l:"Membros",    icon:"👥"},
     {id:"infantil",   l:"Infantil",   icon:"👶"},
-    {id:"relatorio",  l:"Aniversário", icon:"🎂"},
+    {id:"relatorio",  l:"Aniversariantes", icon:"🎂"},
     {id:"agenda",     l:"Agenda",     icon:"📅"},
     {id:"whatsapp",   l:"WhatsApp",   icon:"💬"},
     {id:"secretaria", l:"Secretaria", icon:"📁"},
-    {id:"admin",      l:"Admin",      icon:"⚙️"},
+    ...(isAdmin ? [{id:"admin", l:"Admin", icon:"⚙️"}] : []),
   ];
+  const NAVS = NAVS_ALL;
   const navLabel = NAVS.find(n=>n.id===nav)?.l || "";
   const isMobile = window.innerWidth < 768;
 
@@ -3155,7 +3836,7 @@ function App() {
           </div>
           <div style={{flex:1,minWidth:0}}>
             <div style={{color:"#1e293b",fontWeight:700,fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{user.nome}</div>
-            <div style={{color:"#64748b",fontSize:10}}>{user.nivel==="super"?"Super Admin":"Admin"}</div>
+            <div style={{color:"#64748b",fontSize:10}}>{user.nivel==="super"?"Super Admin":user.nivel==="admin"?"Admin":user.cargo||"Membro"}</div>
           </div>
           {user.nivel==="super" && <span style={{background:"#7c3aed",color:"#fff",borderRadius:5,padding:"1px 6px",fontSize:9,fontWeight:700}}>Super</span>}
         </div>
@@ -3381,7 +4062,7 @@ function App() {
               {nav==="agenda"    && <AgendaView members={members} showToast={showToast}/>}
               {nav==="infantil"  && <InfantilView members={members} showToast={showToast}/>}
               {nav==="whatsapp"  && <WhatsAppView members={members}/>}
-              {nav==="secretaria" && <SecretariaView members={members} showToast={showToast} secPage={secPage}/>}
+              {nav==="secretaria" && <SecretariaView members={members} setMembers={setMembers} save={save} showToast={showToast} secPage={secPage}/>}
               {nav==="admin"     && <AdminView currentUser={user} showToast={showToast} members={members} setMembers={setMembers} save={save}/>}
             </>
         }
