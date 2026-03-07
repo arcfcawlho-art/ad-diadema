@@ -1,1 +1,1 @@
-# add-diadema
+# ad-diadema
